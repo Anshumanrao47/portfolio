@@ -1,0 +1,194 @@
+/**
+ * Orvis annotate bridge — injected into sandbox preview pages by the
+ * proxy (sandbox_net.annotate_bridge). Lets the embedding app screenshot
+ * a region of this page WITHOUT the browser's screen-capture permission
+ * prompt: code running here is same-origin with the page, so it can
+ * rasterize its own DOM (html2canvas, lazy-loaded same-origin) and post
+ * the PNG back to the requesting window.
+ *
+ * Protocol (window.postMessage, both directions):
+ *   parent → page: { type: 'orvis-annotate-capture', id, x, y, w, h }
+ *                    — region in this page's VIEWPORT CSS pixels
+ *   parent → page: { type: 'orvis-annotate-scroll',  dx, dy }
+ *                    — forwarded wheel deltas (the annotate overlay covers
+ *                      the iframe, so native scroll can't reach this page)
+ *   page → parent: { type: 'orvis-annotate-scrolled', dx, dy }
+ *                    — the delta ACTUALLY applied (clamped at document
+ *                      edges); the overlay shifts its marks by this
+ *   page → parent: { type: 'orvis-annotate-result',  id, dataUrl }
+ *                  { type: 'orvis-annotate-result',  id, error }
+ *   parent → page: { type: 'orvis-preview-reload' }
+ *                    — reload this page from INSIDE (a real reload
+ *                      navigation revalidates the document and every
+ *                      sub-resource, unlike re-mounting the iframe, which
+ *                      may serve a cached copy)
+ *   page → parent: { type: 'orvis-preview-reloading' }
+ *                    — ack sent just before reloading; the embedder falls
+ *                      back to re-mounting the iframe if it never arrives
+ *                      (page without the bridge, e.g. non-HTML)
+ *
+ * Replies go to ev.source only. Note this exposes nothing the embedder
+ * couldn't already read by loading the preview URL itself — the URL is
+ * the access token.
+ */
+(function () {
+  'use strict';
+  if (window.__orvisAnnotateBridge) return;
+  window.__orvisAnnotateBridge = true;
+
+  // ?v= must move in lockstep with ANNOTATE_SNIPPET's (annotate_bridge.py)
+  // — it's the cache-buster for the 1h max-age on these assets.
+  var H2C_SRC = '/__orvis/annotate/html2canvas.min.js?v=8';
+  var h2cPromise = null;
+
+
+  // ── Keep the dev server's error screens away from the visitor ──────────
+  //
+  // A preview is a DEV server, so a compile error paints a full-screen stack
+  // trace over the page: file paths, source frames, the lot. The people
+  // looking at these URLs are not developers — they are the owner watching
+  // their site being built, and whoever they shared the link with. The error
+  // still reaches the agent through the dev server's own log, and the build
+  // gate still reads console/page errors through the browser, so nothing that
+  // decides "is this site broken" depends on this overlay being on screen.
+  //
+  // Vite renders it as a custom element (<vite-error-overlay>) with its guts
+  // in a shadow root; Next and friends use a portal div. Both are replaced
+  // with one quiet card. The card is deliberately vague: a visitor cannot act
+  // on a build error, and the owner is told what broke in the chat.
+  var OVERLAY_SELECTOR = 'vite-error-overlay, #vite-error-overlay,' +
+    ' nextjs-portal, [data-nextjs-dialog-overlay], #react-error-overlay';
+  var CARD_ID = '__orvis-updating-card';
+
+  function card() {
+    var el = document.getElementById(CARD_ID);
+    if (el) return el;
+    el = document.createElement('div');
+    el.id = CARD_ID;
+    el.setAttribute('role', 'status');
+    el.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:2147483647',
+      'display:flex', 'align-items:center', 'justify-content:center',
+      'background:#0d1117', 'color:#e6edf3',
+      'font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+      'text-align:center', 'padding:24px',
+    ].join(';');
+    el.innerHTML =
+      '<div style="max-width:380px">' +
+      '<div style="width:30px;height:30px;margin:0 auto 16px;border:3px solid #30363d;' +
+      'border-top-color:#58a6ff;border-radius:50%;animation:__orvisSpin .9s linear infinite"></div>' +
+      '<div style="font-weight:600;margin-bottom:6px">This page is being updated</div>' +
+      '<div style="opacity:.7;font-size:14px">It will come back on its own in a moment.</div>' +
+      '</div>' +
+      '<style>@keyframes __orvisSpin{to{transform:rotate(360deg)}}</style>';
+    return el;
+  }
+
+  function showCard() {
+    var el = card();
+    if (!el.isConnected) (document.body || document.documentElement).appendChild(el);
+  }
+
+  function hideCard() {
+    var el = document.getElementById(CARD_ID);
+    if (el && el.isConnected) el.remove();
+  }
+
+  function sweep() {
+    var found = document.querySelectorAll(OVERLAY_SELECTOR);
+    var removed = 0;
+    for (var i = 0; i < found.length; i++) {
+      // A Next portal is also used for non-error UI; only drop the ones that
+      // actually carry an error dialog.
+      if (found[i].tagName === 'NEXTJS-PORTAL' &&
+          !found[i].querySelector('[data-nextjs-dialog], [data-nextjs-dialog-overlay]')) {
+        continue;
+      }
+      found[i].remove();
+      removed++;
+    }
+    if (removed) showCard(); else hideCard();
+  }
+
+  function watchForOverlays() {
+    try {
+      sweep();
+      new MutationObserver(sweep).observe(
+        document.documentElement, { childList: true, subtree: true });
+    } catch (e) { /* an unsupported browser just sees the overlay */ }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', watchForOverlays);
+  } else {
+    watchForOverlays();
+  }
+
+  function ensureH2C() {
+    if (window.html2canvas) return Promise.resolve(window.html2canvas);
+    if (!h2cPromise) {
+      h2cPromise = new Promise(function (resolve, reject) {
+        var s = document.createElement('script');
+        s.src = H2C_SRC;
+        s.async = true;
+        s.onload = function () {
+          window.html2canvas ? resolve(window.html2canvas) : reject(new Error('html2canvas missing after load'));
+        };
+        s.onerror = function () {
+          h2cPromise = null;
+          reject(new Error('html2canvas failed to load'));
+        };
+        (document.head || document.documentElement).appendChild(s);
+      });
+    }
+    return h2cPromise;
+  }
+
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (!d || !ev.source) return;
+    if (d.type === 'orvis-preview-reload') {
+      try { ev.source.postMessage({ type: 'orvis-preview-reloading' }, '*'); } catch (e) { /* ignore */ }
+      window.location.reload();
+      return;
+    }
+    if (d.type === 'orvis-annotate-scroll') {
+      var bx = window.scrollX, by = window.scrollY;
+      // behavior:'instant' overrides any `scroll-behavior: smooth` the page
+      // sets — a smooth animation restarted every wheel frame feels laggy.
+      window.scrollBy({ left: d.dx || 0, top: d.dy || 0, behavior: 'instant' });
+      ev.source.postMessage(
+        { type: 'orvis-annotate-scrolled', dx: window.scrollX - bx, dy: window.scrollY - by },
+        '*'
+      );
+      return;
+    }
+    if (!d.id || d.type !== 'orvis-annotate-capture') return;
+    var source = ev.source;
+    ensureH2C()
+      .then(function (h2c) {
+        return h2c(document.documentElement, {
+          x: (d.x || 0) + window.scrollX,
+          y: (d.y || 0) + window.scrollY,
+          width: d.w,
+          height: d.h,
+          scale: Math.min(2, window.devicePixelRatio || 1),
+          useCORS: true,
+          logging: false,
+          backgroundColor: '#ffffff',
+        });
+      })
+      .then(function (canvas) {
+        source.postMessage(
+          { type: 'orvis-annotate-result', id: d.id, dataUrl: canvas.toDataURL('image/png') },
+          '*'
+        );
+      })
+      .catch(function (err) {
+        source.postMessage(
+          { type: 'orvis-annotate-result', id: d.id, error: String((err && err.message) || err) },
+          '*'
+        );
+      });
+  });
+})();
